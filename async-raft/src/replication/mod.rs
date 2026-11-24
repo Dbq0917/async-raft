@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, Duration, Interval};
 
-use crate::config::{Config, SnapshotPolicy};
+use crate::config::Config;
 use crate::error::RaftResult;
 use crate::raft::{AppendEntriesRequest, Entry, EntryPayload, InstallSnapshotRequest};
 use crate::storage::CurrentSnapshotData;
@@ -243,12 +243,9 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Re
                 // If running at line rate, and our buffered outbound requests have accumulated too
                 // much, we need to purge and transition to a lagging state. The target is not able to
                 // replicate data fast enough.
-                let is_lagging = self
-                    .last_log_index
-                    .checked_sub(self.match_index)
-                    .map(|diff| diff > self.config.replication_lag_threshold)
-                    .unwrap_or(false);
-                if is_lagging {
+                if self.needs_snapshot() {
+                    self.target_state = TargetReplState::Snapshotting;
+                } else if self.last_log_index.saturating_sub(self.match_index) > self.config.replication_lag_threshold {
                     self.target_state = TargetReplState::Lagging;
                 }
             }
@@ -281,7 +278,11 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Re
             // If conflict index is 0, we will not be able to fetch that index from storage because
             // it will never exist. So instead, we just return, and accept the conflict data.
             if conflict.index == 0 {
-                self.target_state = TargetReplState::Lagging;
+                self.target_state = if self.needs_snapshot() {
+                    TargetReplState::Snapshotting
+                } else {
+                    TargetReplState::Lagging
+                };
                 let _ = self.rafttx.send(ReplicaEvent::UpdateMatchIndex {
                     target: self.target,
                     match_index: self.match_index,
@@ -319,25 +320,17 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Re
                 }
             };
 
-            // Check snapshot policy and handle conflict as needed.
+            // Decide whether the remaining tail is small enough to replicate as logs.
             let _ = self.rafttx.send(ReplicaEvent::UpdateMatchIndex {
                 target: self.target,
                 match_index: self.match_index,
                 match_term: self.match_term,
             });
-            match &self.config.snapshot_policy {
-                SnapshotPolicy::LogsSinceLast(threshold) => {
-                    let diff = self.last_log_index - conflict.index; // NOTE WELL: underflow is guarded against above.
-                    if &diff >= threshold {
-                        // Follower is far behind and needs to receive an InstallSnapshot RPC.
-                        self.target_state = TargetReplState::Snapshotting;
-                        return;
-                    }
-                    // Follower is behind, but not too far behind to receive an InstallSnapshot RPC.
-                    self.target_state = TargetReplState::Lagging;
-                    return;
-                }
-            }
+            self.target_state = if self.needs_snapshot() {
+                TargetReplState::Snapshotting
+            } else {
+                TargetReplState::Lagging
+            };
         }
     }
 
@@ -345,22 +338,19 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Re
     /// snapshot is warranted.
     #[tracing::instrument(level = "trace", skip(self))]
     pub(self) fn needs_snapshot(&self) -> bool {
-        match &self.config.snapshot_policy {
-            SnapshotPolicy::LogsSinceLast(threshold) => {
-                let needs_snap = self
-                    .commit_index
-                    .checked_sub(self.match_index)
-                    .map(|diff| diff >= *threshold)
-                    .unwrap_or(false);
-                if needs_snap {
-                    tracing::trace!("snapshot needed");
-                    true
-                } else {
-                    tracing::trace!("snapshot not needed");
-                    false
-                }
-            }
+        let lag = self.committed_lag();
+        let threshold = self.config.replication_snapshot_threshold;
+        let needs_snap = lag_requires_snapshot(lag, threshold);
+        if needs_snap {
+            tracing::trace!(lag, threshold, "snapshot needed");
+        } else {
+            tracing::trace!(lag, threshold, "snapshot not needed");
         }
+        needs_snap
+    }
+
+    fn committed_lag(&self) -> u64 {
+        self.commit_index.saturating_sub(self.match_index)
     }
 
     /// Fully drain the channel coming in from the Raft node.
@@ -434,6 +424,14 @@ enum TargetReplState {
     Snapshotting,
     /// The replication stream is shutting down.
     Shutdown,
+}
+
+/// Whether a follower's log gap is large enough to prefer snapshot transfer.
+///
+/// A zero threshold disables threshold-based snapshot selection. Missing compacted logs still
+/// force snapshot transfer through the storage lookup paths.
+fn lag_requires_snapshot(lag: u64, threshold: u64) -> bool {
+    threshold > 0 && lag >= threshold
 }
 
 /// An event from the Raft node.
@@ -668,6 +666,13 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
                     return;
                 }
             };
+            if entries.is_empty() {
+                // `is_up_to_speed` ensured that `next_index` is at or below `commit_index`. If the
+                // committed entry is absent from the log, it has been compacted and only a
+                // snapshot can bring the follower forward.
+                self.core.target_state = TargetReplState::Snapshotting;
+                return;
+            }
             for entry in entries.iter() {
                 if let EntryPayload::SnapshotPointer(_) = entry.payload {
                     self.core.target_state = TargetReplState::Snapshotting;
@@ -834,5 +839,29 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
                 self.core.drain_raftrx(event);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lag_requires_snapshot;
+
+    #[test]
+    fn million_log_lag_uses_snapshot_threshold() {
+        assert!(lag_requires_snapshot(1_000_000, 5_000));
+        assert!(lag_requires_snapshot(1_000_000, 1_000));
+    }
+
+    #[test]
+    fn slight_lag_keeps_log_replication() {
+        assert!(!lag_requires_snapshot(0, 5_000));
+        assert!(!lag_requires_snapshot(4_999, 5_000));
+        assert!(lag_requires_snapshot(5_000, 5_000));
+        assert!(!lag_requires_snapshot(999, 1_000));
+    }
+
+    #[test]
+    fn zero_threshold_disables_proactive_snapshot_selection() {
+        assert!(!lag_requires_snapshot(1_000_000, 0));
     }
 }

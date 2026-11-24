@@ -358,6 +358,16 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
     /// Trigger a log compaction (snapshot) job if needed.
     #[tracing::instrument(level = "trace", skip(self))]
     pub(self) fn trigger_log_compaction_if_needed(&mut self) {
+        self.trigger_log_compaction(false);
+    }
+
+    /// Trigger a snapshot because a lagging replication stream needs one.
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub(self) fn trigger_replication_snapshot(&mut self) {
+        self.trigger_log_compaction(true);
+    }
+
+    fn trigger_log_compaction(&mut self, force: bool) {
         if self.snapshot_state.is_some() {
             return;
         }
@@ -366,14 +376,16 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
         if self.last_applied == 0 || self.last_applied < self.snapshot_index {
             return;
         }
-        // If we are below the threshold, then there is nothing to do.
-        let is_below_threshold = self
-            .last_applied
-            .checked_sub(self.snapshot_index)
-            .map(|diff| diff < *threshold)
-            .unwrap_or(false);
-        if is_below_threshold {
-            return;
+        if !force {
+            // If we are below the threshold, then there is nothing to do.
+            let is_below_threshold = self
+                .last_applied
+                .checked_sub(self.snapshot_index)
+                .map(|diff| diff < *threshold)
+                .unwrap_or(false);
+            if is_below_threshold {
+                return;
+            }
         }
 
         // At this point, we are clear to begin a new compaction process.

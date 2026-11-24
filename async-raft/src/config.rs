@@ -17,6 +17,12 @@ pub const DEFAULT_LOGS_SINCE_LAST: u64 = 5000;
 pub const DEFAULT_MAX_PAYLOAD_ENTRIES: u64 = 300;
 /// Default replication lag threshold.
 pub const DEFAULT_REPLICATION_LAG_THRESHOLD: u64 = 1000;
+/// Default lag threshold after which snapshot-based catch-up is preferred.
+pub const DEFAULT_REPLICATION_SNAPSHOT_THRESHOLD: u64 = DEFAULT_LOGS_SINCE_LAST;
+
+const fn default_replication_snapshot_threshold() -> u64 {
+    DEFAULT_REPLICATION_SNAPSHOT_THRESHOLD
+}
 /// Default snapshot chunksize.
 pub const DEFAULT_SNAPSHOT_CHUNKSIZE: u64 = 1024 * 1024 * 3;
 
@@ -96,7 +102,18 @@ pub struct Config {
     /// the cluster. Once a replication stream is considered lagging, it will stop buffering
     /// entries being replicated, and instead will fetch entries directly from the log until it is
     /// up-to-speed, at which time it will transition out of "lagging" state back into "line-rate" state.
+    ///
+    /// If `replication_snapshot_threshold` is not configured separately, an explicitly configured
+    /// value here also sets the distance at which catch-up switches from logs to a snapshot.
     pub replication_lag_threshold: u64,
+    /// The maximum number of log entries a follower may be behind before catch-up switches from
+    /// log entries to a snapshot.
+    ///
+    /// This is intentionally independent from [`SnapshotPolicy::LogsSinceLast`], which controls
+    /// when the leader builds periodic snapshots. When a follower is beyond this distance and no
+    /// sufficiently recent snapshot is available, the leader builds a snapshot on demand.
+    #[serde(default = "default_replication_snapshot_threshold")]
+    pub replication_snapshot_threshold: u64,
     /// The snapshot policy to use for a Raft node.
     pub snapshot_policy: SnapshotPolicy,
     /// The maximum snapshot chunk size allowed when transmitting snapshots (in bytes).
@@ -118,6 +135,7 @@ impl Config {
             heartbeat_interval: None,
             max_payload_entries: None,
             replication_lag_threshold: None,
+            replication_snapshot_threshold: None,
             snapshot_policy: None,
             snapshot_max_chunk_size: None,
         }
@@ -147,6 +165,8 @@ pub struct ConfigBuilder {
     pub max_payload_entries: Option<u64>,
     /// The distance behind in log replication a follower must fall before it is considered "lagging".
     pub replication_lag_threshold: Option<u64>,
+    /// The distance behind in log replication after which a snapshot is used for catch-up.
+    pub replication_snapshot_threshold: Option<u64>,
     /// The snapshot policy.
     pub snapshot_policy: Option<SnapshotPolicy>,
     /// The maximum snapshot chunk size.
@@ -184,6 +204,24 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the desired value for `replication_snapshot_threshold`.
+    pub fn replication_snapshot_threshold(mut self, val: u64) -> Self {
+        self.replication_snapshot_threshold = Some(val);
+        self
+    }
+
+    /// Alias for [`ConfigBuilder::replication_snapshot_threshold`].
+    pub fn snapshot_lag_threshold(mut self, val: u64) -> Self {
+        self.replication_snapshot_threshold = Some(val);
+        self
+    }
+
+    /// Alias for [`ConfigBuilder::replication_snapshot_threshold`].
+    pub fn snapshot_threshold(mut self, val: u64) -> Self {
+        self.replication_snapshot_threshold = Some(val);
+        self
+    }
+
     /// Set the desired value for `snapshot_policy`.
     pub fn snapshot_policy(mut self, val: SnapshotPolicy) -> Self {
         self.snapshot_policy = Some(val);
@@ -211,6 +249,10 @@ impl ConfigBuilder {
             return Err(ConfigError::MaxPayloadEntriesTooSmall);
         }
         let replication_lag_threshold = self.replication_lag_threshold.unwrap_or(DEFAULT_REPLICATION_LAG_THRESHOLD);
+        let replication_snapshot_threshold = self
+            .replication_snapshot_threshold
+            .or(self.replication_lag_threshold)
+            .unwrap_or(DEFAULT_REPLICATION_SNAPSHOT_THRESHOLD);
         let snapshot_policy = self.snapshot_policy.unwrap_or_else(SnapshotPolicy::default);
         let snapshot_max_chunk_size = self.snapshot_max_chunk_size.unwrap_or(DEFAULT_SNAPSHOT_CHUNKSIZE);
         Ok(Config {
@@ -220,6 +262,7 @@ impl ConfigBuilder {
             heartbeat_interval,
             max_payload_entries,
             replication_lag_threshold,
+            replication_snapshot_threshold,
             snapshot_policy,
             snapshot_max_chunk_size,
         })
@@ -242,6 +285,7 @@ mod tests {
         assert!(cfg.heartbeat_interval == DEFAULT_HEARTBEAT_INTERVAL as u64);
         assert!(cfg.max_payload_entries == DEFAULT_MAX_PAYLOAD_ENTRIES);
         assert!(cfg.replication_lag_threshold == DEFAULT_REPLICATION_LAG_THRESHOLD);
+        assert!(cfg.replication_snapshot_threshold == DEFAULT_REPLICATION_SNAPSHOT_THRESHOLD);
         assert!(cfg.snapshot_max_chunk_size == DEFAULT_SNAPSHOT_CHUNKSIZE);
         assert!(cfg.snapshot_policy == SnapshotPolicy::LogsSinceLast(DEFAULT_LOGS_SINCE_LAST));
     }
@@ -254,6 +298,7 @@ mod tests {
             .heartbeat_interval(10)
             .max_payload_entries(100)
             .replication_lag_threshold(100)
+            .replication_snapshot_threshold(1000)
             .snapshot_max_chunk_size(200)
             .snapshot_policy(SnapshotPolicy::LogsSinceLast(10000))
             .validate()
@@ -264,8 +309,20 @@ mod tests {
         assert!(cfg.heartbeat_interval == 10);
         assert!(cfg.max_payload_entries == 100);
         assert!(cfg.replication_lag_threshold == 100);
+        assert!(cfg.replication_snapshot_threshold == 1000);
         assert!(cfg.snapshot_max_chunk_size == 200);
         assert!(cfg.snapshot_policy == SnapshotPolicy::LogsSinceLast(10000));
+    }
+
+    #[test]
+    fn test_explicit_lag_threshold_sets_snapshot_threshold_when_absent() {
+        let cfg = Config::build("cluster0".into())
+            .replication_lag_threshold(1234)
+            .validate()
+            .unwrap();
+
+        assert_eq!(cfg.replication_lag_threshold, 1234);
+        assert_eq!(cfg.replication_snapshot_threshold, 1234);
     }
 
     #[test]

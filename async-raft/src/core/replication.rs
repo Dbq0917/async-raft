@@ -1,6 +1,5 @@
 use tokio::sync::oneshot;
 
-use crate::config::SnapshotPolicy;
 use crate::core::{ConsensusState, LeaderState, ReplicationState, SnapshotState, State, UpdateCurrentLeader};
 use crate::error::RaftResult;
 use crate::replication::{RaftEvent, ReplicaEvent, ReplicationStream};
@@ -199,10 +198,7 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
     /// Handle events from replication streams requesting for snapshot info.
     #[tracing::instrument(level = "trace", skip(self, tx))]
     async fn handle_needs_snapshot(&mut self, _: NodeId, tx: oneshot::Sender<CurrentSnapshotData<S::Snapshot>>) -> RaftResult<()> {
-        // Ensure snapshotting is configured, else do nothing.
-        let threshold = match &self.core.config.snapshot_policy {
-            SnapshotPolicy::LogsSinceLast(threshold) => *threshold,
-        };
+        let threshold = self.core.config.replication_snapshot_threshold;
 
         // Check for existence of current snapshot.
         let current_snapshot_opt = self
@@ -220,10 +216,13 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
             }
         }
 
-        // Check if snapshot creation is already in progress. If so, we spawn a task to await its
-        // completion (or cancellation), and respond to the replication stream. The repl stream
-        // will wait for the completion and will then send anothe request to fetch the finished snapshot.
-        // Else we just drop any other state and continue. Leaders never enter `Streaming` state.
+        if self.core.snapshot_state.is_none() {
+            self.core.trigger_replication_snapshot();
+        }
+
+        // Check if snapshot creation is already in progress. If so, keep the response channel
+        // alive until compaction completes. The replication stream then re-requests the finished
+        // snapshot. Leaders never enter `Streaming` state.
         if let Some(SnapshotState::Snapshotting { handle, sender }) = self.core.snapshot_state.take() {
             let mut chan = sender.subscribe();
             tokio::spawn(async move {
@@ -233,14 +232,6 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
             self.core.snapshot_state = Some(SnapshotState::Snapshotting { handle, sender });
             return Ok(());
         }
-
-        // At this point, we just attempt to request a snapshot. Under normal circumstances, the
-        // leader will always be keeping up-to-date with its snapshotting, and the latest snapshot
-        // will always be found and this block will never even be executed.
-        //
-        // If this block is executed, and a snapshot is needed, the repl stream will submit another
-        // request here shortly, and will hit the above logic where it will await the snapshot completion.
-        self.core.trigger_log_compaction_if_needed();
         Ok(())
     }
 }
