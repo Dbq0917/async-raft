@@ -9,6 +9,9 @@ use crate::error::ConfigError;
 pub const DEFAULT_ELECTION_TIMEOUT_MIN: u64 = 150;
 /// Default election timeout maximum, in milliseconds.
 pub const DEFAULT_ELECTION_TIMEOUT_MAX: u64 = 300;
+/// Default number of unresolved election rounds after which the deterministic priority
+/// tie-break is allowed to end an exact half vote in an even-sized cluster.
+pub const DEFAULT_ELECTION_TIE_BREAK_ROUNDS: u64 = 2;
 /// Default heartbeat interval.
 pub const DEFAULT_HEARTBEAT_INTERVAL: u64 = 50;
 /// Default threshold for when to trigger a snapshot.
@@ -19,6 +22,10 @@ pub const DEFAULT_MAX_PAYLOAD_ENTRIES: u64 = 300;
 pub const DEFAULT_REPLICATION_LAG_THRESHOLD: u64 = 1000;
 /// Default snapshot chunksize.
 pub const DEFAULT_SNAPSHOT_CHUNKSIZE: u64 = 1024 * 1024 * 3;
+
+/// Cap (as a power-of-two exponent) on the growing split-vote jitter applied to
+/// repeated candidate election timeouts.
+const ELECTION_BACKOFF_JITTER_CAP_ROUNDS: u64 = 3;
 
 /// Log compaction and snapshot policy.
 ///
@@ -73,6 +80,18 @@ pub struct Config {
     pub election_timeout_min: u64,
     /// The maximum election timeout in milliseconds.
     pub election_timeout_max: u64,
+    /// Number of consecutive election rounds which end without a winner before the
+    /// deterministic priority tie-break may convert an exact half vote into leadership.
+    ///
+    /// In an even-sized cluster split cleanly into two halves, standard majority voting can
+    /// never produce a winner: each side holds exactly half the votes. After this many failed
+    /// rounds, the single globally-configured member with the smallest node ID is allowed to
+    /// win on its half quorum instead of campaigning forever. Because only one node in the
+    /// entire cluster can satisfy the minimum-ID condition, both halves can never promote
+    /// their own tie-break leader.
+    ///
+    /// A value of `0` disables the tie-break and preserves strict majority-only elections.
+    pub election_tie_break_rounds: u64,
     /// The heartbeat interval in milliseconds at which leaders will send heartbeats to followers.
     ///
     /// Defaults to 50 milliseconds.
@@ -120,12 +139,37 @@ impl Config {
             replication_lag_threshold: None,
             snapshot_policy: None,
             snapshot_max_chunk_size: None,
+            election_tie_break_rounds: None,
         }
     }
 
     /// Generate a new random election timeout within the configured min & max.
     pub fn new_rand_election_timeout(&self) -> u64 {
         thread_rng().gen_range(self.election_timeout_min, self.election_timeout_max)
+    }
+
+    /// Generate the election timeout for a candidate which has already lived through
+    /// `failed_rounds` unsuccessful campaigns.
+    ///
+    /// The first campaign (`failed_rounds == 0`) uses the plain randomized interval. Every
+    /// failed round adds a growing random jitter. The jitter has a floor derived from the
+    /// configured maximum, so candidates which started in lock-step under a tightly configured
+    /// timeout interval still drift apart instead of reproducing the same term-aligned split
+    /// vote round after round. Growth is capped so that a healed cluster reconverges promptly.
+    pub fn new_candidate_election_timeout(&self, failed_rounds: u64) -> u64 {
+        let base = self.new_rand_election_timeout();
+        if failed_rounds == 0 {
+            return base;
+        }
+        let span = self
+            .election_timeout_max
+            .saturating_sub(self.election_timeout_min)
+            .max(self.election_timeout_max / 2)
+            .max(1);
+        let shift = failed_rounds.min(ELECTION_BACKOFF_JITTER_CAP_ROUNDS) as u32;
+        let jitter_limit = span.saturating_mul(1u64 << shift);
+        let jitter = thread_rng().gen_range(0, jitter_limit.max(1));
+        base.saturating_add(jitter)
     }
 }
 
@@ -141,6 +185,9 @@ pub struct ConfigBuilder {
     pub election_timeout_min: Option<u64>,
     /// The maximum election timeout, in milliseconds.
     pub election_timeout_max: Option<u64>,
+    /// Number of unresolved election rounds before the deterministic priority tie-break may
+    /// end an exact half vote. `0` disables the tie-break.
+    pub election_tie_break_rounds: Option<u64>,
     /// The interval at which leaders will send heartbeats to followers to avoid election timeout.
     pub heartbeat_interval: Option<u64>,
     /// The maximum number of entries per payload allowed to be transmitted during replication.
@@ -163,6 +210,13 @@ impl ConfigBuilder {
     /// Set the desired value for `election_timeout_max`.
     pub fn election_timeout_max(mut self, val: u64) -> Self {
         self.election_timeout_max = Some(val);
+        self
+    }
+
+    /// Set the number of unresolved election rounds after which the priority tie-break may
+    /// end an exact half vote in an even-sized cluster. `0` disables the tie-break.
+    pub fn election_tie_break_rounds(mut self, val: u64) -> Self {
+        self.election_tie_break_rounds = Some(val);
         self
     }
 
@@ -204,6 +258,9 @@ impl ConfigBuilder {
         if election_timeout_min >= election_timeout_max {
             return Err(ConfigError::InvalidElectionTimeoutMinMax);
         }
+        let election_tie_break_rounds = self
+            .election_tie_break_rounds
+            .unwrap_or(DEFAULT_ELECTION_TIE_BREAK_ROUNDS);
         // Get other values or their defaults.
         let heartbeat_interval = self.heartbeat_interval.unwrap_or(DEFAULT_HEARTBEAT_INTERVAL);
         let max_payload_entries = self.max_payload_entries.unwrap_or(DEFAULT_MAX_PAYLOAD_ENTRIES);
@@ -217,6 +274,7 @@ impl ConfigBuilder {
             cluster_name: self.cluster_name,
             election_timeout_min,
             election_timeout_max,
+            election_tie_break_rounds,
             heartbeat_interval,
             max_payload_entries,
             replication_lag_threshold,
@@ -239,6 +297,7 @@ mod tests {
 
         assert!(cfg.election_timeout_min >= DEFAULT_ELECTION_TIMEOUT_MIN as u64);
         assert!(cfg.election_timeout_max <= DEFAULT_ELECTION_TIMEOUT_MAX as u64);
+        assert_eq!(cfg.election_tie_break_rounds, DEFAULT_ELECTION_TIE_BREAK_ROUNDS);
         assert!(cfg.heartbeat_interval == DEFAULT_HEARTBEAT_INTERVAL as u64);
         assert!(cfg.max_payload_entries == DEFAULT_MAX_PAYLOAD_ENTRIES);
         assert!(cfg.replication_lag_threshold == DEFAULT_REPLICATION_LAG_THRESHOLD);

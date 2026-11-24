@@ -130,6 +130,18 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
                 self.core.set_target_state(State::Leader);
                 return Ok(());
             }
+
+            // Majority is still short (an even cluster split in half lands exactly one vote low).
+            // If this is the unique priority member and it already holds the half mandate after
+            // repeated deadlocks, win as soon as the last reachable half vote lands.
+            if self.tie_break_quorum_reached() {
+                tracing::warn!(
+                    { id = self.core.id, term = self.core.current_term, rounds = self.failed_election_rounds },
+                    "transitioning to leader state via deterministic half-vote tie-break"
+                );
+                self.core.set_target_state(State::Leader);
+                return Ok(());
+            }
         }
 
         // Otherwise, we just return and let the candidate loop wait for more votes to come in.

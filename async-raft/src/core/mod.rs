@@ -284,6 +284,17 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
         }
     }
 
+    /// Set the next election timeout for a campaigning candidate.
+    ///
+    /// Unlike followers, a candidate which has already lived through unresolved campaigns gets
+    /// extra random jitter (see [`Config::new_candidate_election_timeout`]) so that competing
+    /// candidates do not keep firing in lock-step after repeated split votes.
+    fn update_candidate_election_timeout(&mut self, failed_rounds: u64) {
+        let now = Instant::now();
+        let timeout_ms = self.config.new_candidate_election_timeout(failed_rounds);
+        self.next_election_timeout = Some(now + Duration::from_millis(timeout_ms));
+    }
+
     /// Update the value of the `current_leader` property.
     #[tracing::instrument(level = "trace", skip(self))]
     fn update_current_leader(&mut self, update: UpdateCurrentLeader) {
@@ -751,6 +762,11 @@ struct CandidateState<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: 
     votes_granted_new: u64,
     /// The number of votes needed from the new config group in order to become the Raft leader (if applicable).
     votes_needed_new: u64,
+    /// Number of consecutive campaigns that ended via election timeout without a winner.
+    ///
+    /// Persists across term increments within a single candidacy and drives both the split-vote
+    /// backoff jitter and the deterministic half-vote tie-break.
+    failed_election_rounds: u64,
 }
 
 impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> CandidateState<'a, D, R, N, S> {
@@ -761,7 +777,41 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
             votes_needed_old: 0,
             votes_granted_new: 0,
             votes_needed_new: 0,
+            failed_election_rounds: 0,
         }
+    }
+
+    /// Whether this candidate may break an exact 50/50 vote in an even-sized membership.
+    ///
+    /// Every condition is required:
+    /// - the tie-break is enabled via `election_tie_break_rounds`;
+    /// - at least that many campaigns have already timed out without a winner;
+    /// - membership is in uniform consensus (joint consensus keeps its two independent quorums);
+    /// - the voting membership has even size and this candidate holds exactly half of its votes;
+    /// - this candidate is the single smallest configured member ID.
+    ///
+    /// The minimum-ID clause is what prevents a second leader: exactly one configured node can
+    /// ever satisfy it, so the two halves of a symmetric partition cannot both invoke the break.
+    fn tie_break_quorum_reached(&self) -> bool {
+        if self.core.config.election_tie_break_rounds == 0 {
+            return false;
+        }
+        if self.failed_election_rounds < self.core.config.election_tie_break_rounds {
+            return false;
+        }
+        if self.core.membership.members_after_consensus.is_some() {
+            return false;
+        }
+        let members = &self.core.membership.members;
+        let membership_size = members.len();
+        if membership_size < 2 || membership_size % 2 != 0 {
+            return false;
+        }
+        if members.iter().min().copied() != Some(self.core.id) {
+            return false;
+        }
+        let half = (membership_size / 2) as u64;
+        self.votes_granted_old >= half && self.votes_granted_old < self.votes_needed_old
     }
 
     /// Run the candidate loop.
@@ -782,7 +832,10 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
             }
 
             // Setup new term.
-            self.core.update_next_election_timeout(false); // Generates a new rand value within range.
+            // Candidate timeout widens with consecutive failed rounds to break synchronized
+            // split-vote lock-step. Followers still use the plain randomized timeout.
+            self.core
+                .update_candidate_election_timeout(self.failed_election_rounds);
             self.core.current_term += 1;
             self.core.voted_for = Some(self.core.id);
             self.core.update_current_leader(UpdateCurrentLeader::Unknown);
@@ -799,7 +852,22 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
                 }
                 let timeout_fut = sleep_until(self.core.get_next_election_timeout());
                 tokio::select! {
-                    _ = timeout_fut => break, // This election has timed-out. Break to outer loop, which starts a new term.
+                    _ = timeout_fut => {
+                        // This campaign timed out without a winner. Record the deadlock round and,
+                        // once the threshold is reached, let the unique priority member turn its
+                        // exact-half mandate into leadership instead of restarting forever.
+                        self.failed_election_rounds = self.failed_election_rounds.saturating_add(1);
+                        if self.tie_break_quorum_reached() {
+                            tracing::warn!(
+                                { id = self.core.id, term = self.core.current_term, rounds = self.failed_election_rounds },
+                                "ending split-vote deadlock via deterministic priority tie-break"
+                            );
+                            self.core.set_target_state(State::Leader);
+                        }
+                        // Break to the outer loop, which either exits into the Leader state or
+                        // starts a new term with widened backoff.
+                        break;
+                    }
                     Some((res, peer)) = pending_votes.recv() => self.handle_vote_response(res, peer).await?,
                     Some(msg) = self.core.rx_api.recv() => match msg {
                         RaftMsg::AppendEntries{rpc, tx} => {

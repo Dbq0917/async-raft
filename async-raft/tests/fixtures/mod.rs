@@ -44,6 +44,11 @@ pub struct RaftRouter {
     routing_table: RwLock<BTreeMap<NodeId, (MemRaft, Arc<MemStore>)>>,
     /// Nodes which are isolated can neither send nor receive frames.
     isolated_nodes: RwLock<HashSet<NodeId>>,
+    /// Bidirectionally blocked node pairs used to emulate a group network partition.
+    ///
+    /// Pairs are stored canonically as `(min_id, max_id)`. Unlike [`Self::isolated_nodes`],
+    /// blocking only the cross-group pairs leaves communication inside each half intact.
+    blocked_links: RwLock<HashSet<(NodeId, NodeId)>>,
 }
 
 impl RaftRouter {
@@ -53,6 +58,7 @@ impl RaftRouter {
             config,
             routing_table: Default::default(),
             isolated_nodes: Default::default(),
+            blocked_links: Default::default(),
         }
     }
 
@@ -136,6 +142,33 @@ impl RaftRouter {
     pub async fn restore_node(&self, id: NodeId) {
         let mut nodes = self.isolated_nodes.write().await;
         nodes.remove(&id);
+    }
+
+    /// Block traffic in both directions between the two nodes.
+    pub async fn isolate_link(&self, a: NodeId, b: NodeId) {
+        let pair = canonical_pair(a, b);
+        self.blocked_links.write().await.insert(pair);
+    }
+
+    /// Emulate a symmetric network split: every cross-group pair is blocked in both directions,
+    /// while communication inside `group_a` and inside `group_b` keeps working.
+    pub async fn split_network(&self, group_a: &[NodeId], group_b: &[NodeId]) {
+        let mut links = self.blocked_links.write().await;
+        for &a in group_a {
+            for &b in group_b {
+                links.insert(canonical_pair(a, b));
+            }
+        }
+    }
+
+    /// Heal every pairwise split installed via [`Self::split_network`] or [`Self::isolate_link`].
+    pub async fn heal_network(&self) {
+        self.blocked_links.write().await.clear();
+    }
+
+    /// Report whether RPC traffic between the two nodes is currently blocked by a pairwise split.
+    pub async fn is_link_blocked(&self, a: NodeId, b: NodeId) -> bool {
+        self.blocked_links.read().await.contains(&canonical_pair(a, b))
     }
 
     pub async fn add_non_voter(&self, leader: NodeId, target: NodeId) -> Result<(), ChangeConfigError> {
@@ -389,6 +422,9 @@ impl RaftNetwork<MemClientRequest> for RaftRouter {
         if isolated.contains(&target) || isolated.contains(&rpc.leader_id) {
             return Err(anyhow!("target node is isolated"));
         }
+        if self.is_link_blocked(rpc.leader_id, target).await {
+            return Err(anyhow!("network link between leader and target is partitioned"));
+        }
         Ok(addr.0.append_entries(rpc).await?)
     }
 
@@ -399,6 +435,9 @@ impl RaftNetwork<MemClientRequest> for RaftRouter {
         let addr = rt.get(&target).expect("target node not found in routing table");
         if isolated.contains(&target) || isolated.contains(&rpc.leader_id) {
             return Err(anyhow!("target node is isolated"));
+        }
+        if self.is_link_blocked(rpc.leader_id, target).await {
+            return Err(anyhow!("network link between leader and target is partitioned"));
         }
         Ok(addr.0.install_snapshot(rpc).await?)
     }
@@ -411,7 +450,19 @@ impl RaftNetwork<MemClientRequest> for RaftRouter {
         if isolated.contains(&target) || isolated.contains(&rpc.candidate_id) {
             return Err(anyhow!("target node is isolated"));
         }
+        if self.is_link_blocked(rpc.candidate_id, target).await {
+            return Err(anyhow!("network link between candidate and target is partitioned"));
+        }
         Ok(addr.0.vote(rpc).await?)
+    }
+}
+
+/// Build the direction-insensitive key for a node-to-node link.
+fn canonical_pair(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 
