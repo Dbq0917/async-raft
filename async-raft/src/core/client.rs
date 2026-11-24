@@ -301,15 +301,63 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
                     self.core.set_target_state(State::Shutdown);
                 }
             },
-            ClientOrInternalResponseTx::Internal(tx) => {
-                self.core.last_applied = req.entry.index;
-                self.core.report_metrics();
-                let _ = tx.send(Ok(req.entry.index));
-            }
+            ClientOrInternalResponseTx::Internal(tx) => match self.apply_committed_entries_to_state_machine(req.entry.index).await {
+                Ok(()) => {
+                    let _ = tx.send(Ok(req.entry.index));
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err));
+                }
+            },
         }
 
         // Trigger log compaction if needed.
         self.core.trigger_log_compaction_if_needed();
+    }
+
+    /// Apply all logs through the given index to the state machine.
+    ///
+    /// This is used when a leader's current-term entry commits older entries which were persisted
+    /// before a restart, but which may not have made it to the state machine. Starting at
+    /// `last_applied + 1` ensures entries which were already applied are not written twice.
+    async fn apply_committed_entries_to_state_machine(&mut self, through: u64) -> RaftResult<()> {
+        // Ensure any state machine replication started before a leadership transition has
+        // completed before replaying from the persisted applied index.
+        if !self.core.replicate_to_sm_handle.is_empty() {
+            if let Some(Ok(replicate_to_sm_result)) = self.core.replicate_to_sm_handle.next().await {
+                self.core.handle_replicate_to_sm_result(replicate_to_sm_result)?;
+            }
+        }
+
+        if through <= self.core.last_applied {
+            return Ok(());
+        }
+
+        let start = self.core.last_applied + 1;
+        let entries = self
+            .core
+            .storage
+            .get_log_entries(start, through + 1)
+            .await
+            .map_err(|err| self.core.map_fatal_storage_error(err))?;
+        let data_entries: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| match &entry.payload {
+                EntryPayload::Normal(inner) => Some((&entry.index, &inner.data)),
+                _ => None,
+            })
+            .collect();
+        if !data_entries.is_empty() {
+            self.core
+                .storage
+                .replicate_to_state_machine(&data_entries)
+                .await
+                .map_err(|err| self.core.map_fatal_storage_error(err))?;
+        }
+
+        self.core.last_applied = through;
+        self.core.report_metrics();
+        Ok(())
     }
 
     /// Apply the given log entry to the state machine.
@@ -321,40 +369,10 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
         //
         // Note that this would only ever happen if a node had unapplied logs from before becoming leader.
         let expected_next_index = self.core.last_applied + 1;
-        if index != &expected_next_index {
-            let entries = self
-                .core
-                .storage
-                .get_log_entries(expected_next_index, *index)
-                .await
-                .map_err(|err| self.core.map_fatal_storage_error(err))?;
-            if let Some(entry) = entries.last() {
-                self.core.last_applied = entry.index;
-            }
-            let data_entries: Vec<_> = entries
-                .iter()
-                .filter_map(|entry| match &entry.payload {
-                    EntryPayload::Normal(inner) => Some((&entry.index, &inner.data)),
-                    _ => None,
-                })
-                .collect();
-            if !data_entries.is_empty() {
-                self.core
-                    .storage
-                    .replicate_to_state_machine(&data_entries)
-                    .await
-                    .map_err(|err| self.core.map_fatal_storage_error(err))?;
-            }
+        if *index > expected_next_index {
+            self.apply_committed_entries_to_state_machine(*index - 1).await?;
         }
 
-        // Before we can safely apply this entry to the state machine, we need to ensure there is
-        // no pending task to replicate entries to the state machine. This is edge case, and would only
-        // happen once very early in a new leader's term.
-        if !self.core.replicate_to_sm_handle.is_empty() {
-            if let Some(Ok(replicate_to_sm_result)) = self.core.replicate_to_sm_handle.next().await {
-                self.core.handle_replicate_to_sm_result(replicate_to_sm_result)?;
-            }
-        }
         // Apply this entry to the state machine and return its data response.
         let res = self.core.storage.apply_entry_to_state_machine(index, entry).await.map_err(|err| {
             if err.downcast_ref::<S::ShutdownError>().is_some() {
